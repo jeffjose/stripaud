@@ -1,0 +1,274 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "questionary>=2.0",
+#     "rich>=13.7",
+# ]
+# ///
+"""stripaud - interactive audio track manager for video files.
+
+Pick files (fzf-style fuzzy multi-select), choose which audio tracks to keep,
+and strip the rest with ffmpeg (stream copy, no re-encode).
+
+Usage:
+    stripaud video.mp4                 # single file
+    stripaud /path/to/videos           # search a directory, then pick
+    stripaud /path/to/*prefix*         # glob (expanded by your shell)
+    stripaud . --dry-run               # walk the flow, change nothing
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import questionary
+from questionary import Choice
+from rich.console import Console
+
+console = Console()
+err = Console(stderr=True)
+
+MEDIA_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+
+# fzf preview: show the audio streams of the highlighted file
+FZF_PREVIEW = (
+    "ffprobe -v error -select_streams a "
+    "-show_entries stream=index,codec_name:stream_tags=language,title "
+    "-of default=noprint_wrappers=1 {} 2>/dev/null | head -40"
+)
+
+
+def gather_candidates(paths):
+    """Expand args into a de-duplicated, sorted list of media files.
+
+    Directories are searched recursively; individual files are taken as-is
+    if they have a known media extension. Globs are already expanded by the
+    shell before they reach us.
+    """
+    files = []
+    seen = set()
+
+    def add(p):
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            files.append(p)
+
+    for raw in paths:
+        p = Path(raw)
+        if p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.is_file() and f.suffix.lower() in MEDIA_EXTS:
+                    add(f)
+        elif p.is_file():
+            if p.suffix.lower() in MEDIA_EXTS:
+                add(p)
+            else:
+                err.print(f"[yellow]Skipping non-media file:[/] {p}")
+        else:
+            err.print(f"[yellow]No such file or directory:[/] {p}")
+
+    return sorted(files, key=lambda f: str(f))
+
+
+def pick_files(candidates):
+    """Step 0: choose which files to work on. Returns a list of Paths."""
+    if len(candidates) == 1:
+        return candidates
+
+    if shutil.which("fzf"):
+        proc = subprocess.run(
+            [
+                "fzf",
+                "--multi",
+                "--prompt", "Select media file(s) [TAB to mark]: ",
+                "--header", "TAB to mark multiple · ENTER to confirm · ESC to cancel",
+                "--height", "60%",
+                "--layout", "reverse",
+                "--border",
+                "--preview", FZF_PREVIEW,
+                "--preview-window", "right:50%:wrap",
+            ],
+            input="\n".join(str(c) for c in candidates),
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode not in (0,):  # 130 = cancelled, 1 = no match
+            return []
+        return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
+
+    # Fallback: questionary checkbox picker (no fzf installed)
+    choices = [Choice(title=str(c), value=c) for c in candidates]
+    picked = questionary.checkbox(
+        "Select media file(s) to work on:", choices=choices
+    ).ask()
+    return picked or []
+
+
+def get_audio_tracks(path):
+    """Return a list of audio-track dicts in audio-stream order."""
+    proc = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index,codec_name:stream_tags=language,title",
+            "-of", "json",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    try:
+        streams = json.loads(proc.stdout or "{}").get("streams", [])
+    except json.JSONDecodeError:
+        streams = []
+
+    tracks = []
+    for i, s in enumerate(streams):
+        tags = s.get("tags", {}) or {}
+        tracks.append(
+            {
+                "audio_index": i,  # 0-based index among audio streams (for -map 0:a:N)
+                "codec": s.get("codec_name", "?"),
+                "language": tags.get("language", "und"),
+                "title": tags.get("title", ""),
+            }
+        )
+    return tracks
+
+
+def track_label(n, t):
+    title = t["title"] or "—"
+    return f"Track {n}: {t['codec']}, lang={t['language']}, title={title}"
+
+
+def choose_tracks(tracks):
+    """Checkbox UI. Returns list of audio_index values to KEEP, or None if cancelled."""
+    choices = [
+        Choice(title=track_label(i + 1, t), value=t["audio_index"], checked=True)
+        for i, t in enumerate(tracks)
+    ]
+    return questionary.checkbox(
+        "Select audio tracks to KEEP (SPACE toggles, ENTER confirms):",
+        choices=choices,
+    ).ask()
+
+
+def build_ffmpeg_cmd(input_file, keep_indices, output_file):
+    cmd = ["ffmpeg", "-i", str(input_file), "-map", "0:v"]
+    for idx in keep_indices:
+        cmd += ["-map", f"0:a:{idx}?"]
+    cmd += ["-map", "0:s?", "-map", "0:d?", "-map", "0:t?", "-c", "copy", str(output_file)]
+    return cmd
+
+
+def quote_cmd(cmd):
+    import shlex
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
+def process_file(input_file, idx, total, dry_run):
+    if total > 1:
+        console.rule(f"[bold]{idx}/{total}[/]  {input_file.name}")
+    else:
+        console.print(f"\n[bold]{input_file.name}[/]")
+
+    tracks = get_audio_tracks(input_file)
+    if not tracks:
+        console.print("[yellow]No audio tracks found. Skipping.[/]")
+        return "skipped"
+
+    keep = choose_tracks(tracks)
+    if keep is None:
+        console.print("[yellow]Cancelled. Skipping this file.[/]")
+        return "skipped"
+    if not keep:
+        console.print("[yellow]No tracks selected. Skipping this file.[/]")
+        return "skipped"
+
+    keep_set = set(keep)
+    kept = [t for t in tracks if t["audio_index"] in keep_set]
+    dropped = [t for t in tracks if t["audio_index"] not in keep_set]
+
+    console.print(f"[green]Keep:[/] {', '.join(track_label(t['audio_index'] + 1, t) for t in kept)}")
+    if dropped:
+        console.print(f"[red]Drop:[/] {', '.join(track_label(t['audio_index'] + 1, t) for t in dropped)}")
+
+    if len(keep) == len(tracks):
+        console.print("[dim]All tracks kept — no changes needed.[/]")
+        return "noop"
+
+    output_file = input_file.with_name(f"{input_file.stem}.temp{input_file.suffix}")
+    cmd = build_ffmpeg_cmd(input_file, sorted(keep), output_file)
+
+    if dry_run:
+        console.print("[bold cyan]DRY RUN[/] — would execute:")
+        console.print(f"  [dim]{quote_cmd(cmd)}[/]")
+        console.print(f"  [dim]then replace[/] {input_file}")
+        return "dry-run"
+
+    console.print(f"[dim]{quote_cmd(cmd)}[/]")
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        os.replace(output_file, input_file)
+        console.print("[green]✓ Done.[/]")
+        return "ok"
+    else:
+        if output_file.exists():
+            output_file.unlink()
+        err.print("[red]✗ ffmpeg failed; original left untouched.[/]")
+        return "failed"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="stripaud",
+        description="Interactively strip unwanted audio tracks from video files.",
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="media file(s), a directory to search, or a glob (shell-expanded)",
+    )
+    parser.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        help="walk the full flow but take no action (no ffmpeg, no file changes)",
+    )
+    args = parser.parse_args()
+
+    candidates = gather_candidates(args.paths)
+    if not candidates:
+        err.print("[red]No media files found.[/]")
+        sys.exit(1)
+
+    selected = pick_files(candidates)
+    if not selected:
+        console.print("No file selected.")
+        sys.exit(0)
+
+    if args.dry_run:
+        console.print("[bold cyan]-- dry run: no files will be modified --[/]")
+
+    counts = {}
+    for i, f in enumerate(selected, 1):
+        outcome = process_file(f, i, len(selected), args.dry_run)
+        counts[outcome] = counts.get(outcome, 0) + 1
+
+    if len(selected) > 1:
+        console.rule("[bold]Summary[/]")
+        for outcome, n in counts.items():
+            console.print(f"  {outcome}: {n}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        err.print("\n[yellow]Interrupted.[/]")
+        sys.exit(130)
