@@ -21,7 +21,6 @@ Usage:
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -86,26 +85,30 @@ def gather_candidates(paths):
 def fzf_pick(candidates):
     """Run fzf to multi-select from candidates. Returns a list of Paths, or
     None if fzf is unusable (not installed / failed to start its UI)."""
-    if not shutil.which("fzf"):
+    try:
+        proc = subprocess.run(
+            [
+                "fzf",
+                "--multi",
+                "--prompt", "Select media file(s) [TAB to mark]: ",
+                "--header", "TAB to mark multiple · ENTER to confirm · ESC to cancel",
+                "--height", "60%",
+                "--layout", "reverse",
+                "--border",
+            ],
+            input="\n".join(str(c) for c in candidates),
+            text=True,
+            # fzf draws its UI on /dev/tty (not stdout/stderr), so capturing both
+            # is safe and lets us report *why* fzf failed instead of bailing quietly.
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        err.print(
+            "[yellow]fzf not found on PATH for this process — using the basic "
+            "list picker.[/] Run [bold]which fzf[/] in the same shell to check."
+        )
         return None
-
-    proc = subprocess.run(
-        [
-            "fzf",
-            "--multi",
-            "--prompt", "Select media file(s) [TAB to mark]: ",
-            "--header", "TAB to mark multiple · ENTER to confirm · ESC to cancel",
-            "--height", "60%",
-            "--layout", "reverse",
-            "--border",
-        ],
-        input="\n".join(str(c) for c in candidates),
-        text=True,
-        # fzf draws its UI on /dev/tty (not stdout/stderr), so capturing both is
-        # safe and lets us report *why* fzf failed instead of silently bailing.
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
     if proc.returncode == 0:
         return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
     if proc.returncode in (1, 130):
