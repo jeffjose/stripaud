@@ -97,6 +97,9 @@ def pick_files(candidates):
             input="\n".join(str(c) for c in candidates),
             text=True,
             capture_output=True,
+            # fzf runs --preview via $SHELL; force sh so the POSIX preview
+            # (2>/dev/null | head) works even when invoked from tcsh/csh.
+            env={**os.environ, "SHELL": "/bin/sh"},
         )
         if proc.returncode not in (0,):  # 130 = cancelled, 1 = no match
             return []
