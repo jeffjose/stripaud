@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 import questionary
+import questionary.prompts.common
 from questionary import Choice
 from rich.console import Console
 
@@ -35,18 +36,16 @@ err = Console(stderr=True)
 
 MEDIA_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
 
-# Explicit style using the terminal's own palette (ansi* names) so it looks
-# right on any theme: the active line is reverse-video (like the original
-# tool), checked items are plain green — no surprise background colors.
+# Render checkboxes as plain [ ] / [x] with no color and no full-row highlight.
+# Selection is shown by the glyph; the » pointer marks the active row.
+questionary.prompts.common.INDICATOR_SELECTED = "[x]"
+questionary.prompts.common.INDICATOR_UNSELECTED = "[ ]"
+
 TRACK_STYLE = questionary.Style(
     [
-        ("qmark", "fg:ansicyan bold"),
         ("question", "bold"),
-        ("instruction", "fg:ansibrightblack"),
-        ("pointer", "fg:ansicyan bold"),
-        ("highlighted", "reverse"),
-        ("selected", "fg:ansigreen"),
-        ("answer", "fg:ansicyan bold"),
+        ("highlighted", "noreverse"),  # active row: no reverse-video
+        ("selected", "noreverse"),     # checked rows: no color
     ]
 )
 
