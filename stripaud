@@ -21,6 +21,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -82,13 +83,57 @@ def gather_candidates(paths):
     return sorted(files, key=lambda f: str(f))
 
 
+def find_fzf():
+    """Locate the fzf binary, even when it isn't on PATH (common with mise /
+    linuxbrew, whose bin dirs are often not exported). Returns a path or None."""
+    # 1. Normal PATH lookup.
+    found = shutil.which("fzf")
+    if found:
+        return found
+
+    # 2. Ask mise, if present — it manages fzf on these hosts.
+    if shutil.which("mise"):
+        try:
+            out = subprocess.run(
+                ["mise", "which", "fzf"], text=True, capture_output=True
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        except OSError:
+            pass
+
+    # 3. Known install locations not always on PATH.
+    candidates = [
+        Path(os.environ["MISEPATH"]) / "fzf" if os.environ.get("MISEPATH") else None,
+        Path.home() / ".local/share/mise/shims/fzf",
+        Path(os.environ["BREWPATH"]) / "bin/fzf" if os.environ.get("BREWPATH") else None,
+        Path("/home/linuxbrew/.linuxbrew/bin/fzf"),
+        Path.home() / ".local/bin/fzf",
+        Path("/usr/local/bin/fzf"),
+        Path("/usr/bin/fzf"),
+    ]
+    for c in candidates:
+        if c and c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+
+    return None
+
+
 def fzf_pick(candidates):
     """Run fzf to multi-select from candidates. Returns a list of Paths, or
     None if fzf is unusable (not installed / failed to start its UI)."""
+    fzf = find_fzf()
+    if not fzf:
+        err.print(
+            "[yellow]fzf not found (not on PATH, and not resolvable via mise/brew) "
+            "— using the basic list picker.[/]"
+        )
+        return None
+
     try:
         proc = subprocess.run(
             [
-                "fzf",
+                fzf,
                 "--multi",
                 "--prompt", "Select media file(s) [TAB to mark]: ",
                 "--header", "TAB to mark multiple · ENTER to confirm · ESC to cancel",
@@ -103,11 +148,8 @@ def fzf_pick(candidates):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-    except FileNotFoundError:
-        err.print(
-            "[yellow]fzf not found on PATH for this process — using the basic "
-            "list picker.[/] Run [bold]which fzf[/] in the same shell to check."
-        )
+    except OSError as e:
+        err.print(f"[yellow]Could not run fzf ({e}) — using the basic list picker.[/]")
         return None
     if proc.returncode == 0:
         return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
