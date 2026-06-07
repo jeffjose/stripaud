@@ -35,11 +35,19 @@ err = Console(stderr=True)
 
 MEDIA_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
 
-# fzf preview: show the audio streams of the highlighted file
-FZF_PREVIEW = (
-    "ffprobe -v error -select_streams a "
-    "-show_entries stream=index,codec_name:stream_tags=language,title "
-    "-of default=noprint_wrappers=1 {} 2>/dev/null | head -40"
+# Explicit style using the terminal's own palette (ansi* names) so it looks
+# right on any theme: the active line is reverse-video (like the original
+# tool), checked items are plain green — no surprise background colors.
+TRACK_STYLE = questionary.Style(
+    [
+        ("qmark", "fg:ansicyan bold"),
+        ("question", "bold"),
+        ("instruction", "fg:ansibrightblack"),
+        ("pointer", "fg:ansicyan bold"),
+        ("highlighted", "reverse"),
+        ("selected", "fg:ansigreen"),
+        ("answer", "fg:ansicyan bold"),
+    ]
 )
 
 
@@ -91,15 +99,13 @@ def pick_files(candidates):
                 "--height", "60%",
                 "--layout", "reverse",
                 "--border",
-                "--preview", FZF_PREVIEW,
-                "--preview-window", "right:50%:wrap",
             ],
             input="\n".join(str(c) for c in candidates),
             text=True,
-            capture_output=True,
-            # fzf runs --preview via $SHELL; force sh so the POSIX preview
-            # (2>/dev/null | head) works even when invoked from tcsh/csh.
-            env={**os.environ, "SHELL": "/bin/sh"},
+            # Capture only stdout (the selection). fzf draws its interactive UI
+            # to stderr, so it must stay attached to the terminal — capturing it
+            # leaves fzf with nowhere to render the filter box on some hosts.
+            stdout=subprocess.PIPE,
         )
         if proc.returncode not in (0,):  # 130 = cancelled, 1 = no match
             return []
@@ -113,12 +119,14 @@ def pick_files(candidates):
     return picked or []
 
 
-def get_audio_tracks(path):
-    """Return a list of audio-track dicts in audio-stream order."""
+def get_tracks(path, select):
+    """Return track dicts for the given stream type ('a' audio, 's' subtitle),
+    in stream order. The 'index' field is 0-based within that type, suitable
+    for ffmpeg's -map 0:<select>:N."""
     proc = subprocess.run(
         [
             "ffprobe", "-v", "error",
-            "-select_streams", "a",
+            "-select_streams", select,
             "-show_entries", "stream=index,codec_name:stream_tags=language,title",
             "-of", "json",
             str(path),
@@ -136,7 +144,7 @@ def get_audio_tracks(path):
         tags = s.get("tags", {}) or {}
         tracks.append(
             {
-                "audio_index": i,  # 0-based index among audio streams (for -map 0:a:N)
+                "index": i,  # 0-based within this stream type (for -map 0:a:N / 0:s:N)
                 "codec": s.get("codec_name", "?"),
                 "language": tags.get("language", "und"),
                 "title": tags.get("title", ""),
@@ -150,23 +158,26 @@ def track_label(n, t):
     return f"Track {n}: {t['codec']}, lang={t['language']}, title={title}"
 
 
-def choose_tracks(tracks):
-    """Checkbox UI. Returns list of audio_index values to KEEP, or None if cancelled."""
+def choose_tracks(tracks, kind):
+    """Checkbox UI. Returns list of indices to KEEP, or None if cancelled."""
     choices = [
-        Choice(title=track_label(i + 1, t), value=t["audio_index"], checked=True)
+        Choice(title=track_label(i + 1, t), value=t["index"], checked=True)
         for i, t in enumerate(tracks)
     ]
     return questionary.checkbox(
-        "Select audio tracks to KEEP (SPACE toggles, ENTER confirms):",
+        f"Select {kind} tracks to KEEP (SPACE toggles, ENTER confirms):",
         choices=choices,
+        style=TRACK_STYLE,
     ).ask()
 
 
-def build_ffmpeg_cmd(input_file, keep_indices, output_file):
+def build_ffmpeg_cmd(input_file, keep_audio, keep_subs, output_file):
     cmd = ["ffmpeg", "-i", str(input_file), "-map", "0:v"]
-    for idx in keep_indices:
+    for idx in keep_audio:
         cmd += ["-map", f"0:a:{idx}?"]
-    cmd += ["-map", "0:s?", "-map", "0:d?", "-map", "0:t?", "-c", "copy", str(output_file)]
+    for idx in keep_subs:
+        cmd += ["-map", f"0:s:{idx}?"]
+    cmd += ["-map", "0:d?", "-map", "0:t?", "-c", "copy", str(output_file)]
     return cmd
 
 
@@ -181,33 +192,53 @@ def process_file(input_file, idx, total, dry_run):
     else:
         console.print(f"\n[bold]{input_file.name}[/]")
 
-    tracks = get_audio_tracks(input_file)
-    if not tracks:
-        console.print("[yellow]No audio tracks found. Skipping.[/]")
+    audio = get_tracks(input_file, "a")
+    subs = get_tracks(input_file, "s")
+
+    if not audio and not subs:
+        console.print("[yellow]No audio or subtitle tracks found. Skipping.[/]")
         return "skipped"
 
-    keep = choose_tracks(tracks)
-    if keep is None:
-        console.print("[yellow]Cancelled. Skipping this file.[/]")
+    # Step 2: audio tracks
+    keep_audio = [t["index"] for t in audio]
+    if audio:
+        keep_audio = choose_tracks(audio, "audio")
+        if keep_audio is None:
+            console.print("[yellow]Cancelled. Skipping this file.[/]")
+            return "skipped"
+
+    # Step 3: subtitle tracks
+    keep_subs = [t["index"] for t in subs]
+    if subs:
+        keep_subs = choose_tracks(subs, "subtitle")
+        if keep_subs is None:
+            console.print("[yellow]Cancelled. Skipping this file.[/]")
+            return "skipped"
+    else:
+        console.print("[dim]No subtitle tracks.[/]")
+
+    def report(label, tracks, keep):
+        keep_set = set(keep)
+        kept = [t for t in tracks if t["index"] in keep_set]
+        dropped = [t for t in tracks if t["index"] not in keep_set]
+        if kept:
+            console.print(f"[green]Keep {label}:[/] {', '.join(track_label(t['index'] + 1, t) for t in kept)}")
+        if dropped:
+            console.print(f"[red]Drop {label}:[/] {', '.join(track_label(t['index'] + 1, t) for t in dropped)}")
+
+    report("audio", audio, keep_audio)
+    report("subtitle", subs, keep_subs)
+
+    if not keep_audio and not keep_subs:
+        console.print("[yellow]Nothing selected. Skipping this file.[/]")
         return "skipped"
-    if not keep:
-        console.print("[yellow]No tracks selected. Skipping this file.[/]")
-        return "skipped"
 
-    keep_set = set(keep)
-    kept = [t for t in tracks if t["audio_index"] in keep_set]
-    dropped = [t for t in tracks if t["audio_index"] not in keep_set]
-
-    console.print(f"[green]Keep:[/] {', '.join(track_label(t['audio_index'] + 1, t) for t in kept)}")
-    if dropped:
-        console.print(f"[red]Drop:[/] {', '.join(track_label(t['audio_index'] + 1, t) for t in dropped)}")
-
-    if len(keep) == len(tracks):
+    if len(keep_audio) == len(audio) and len(keep_subs) == len(subs):
         console.print("[dim]All tracks kept — no changes needed.[/]")
         return "noop"
 
     output_file = input_file.with_name(f"{input_file.stem}.temp{input_file.suffix}")
-    cmd = build_ffmpeg_cmd(input_file, sorted(keep), output_file)
+    cmd = build_ffmpeg_cmd(input_file, sorted(keep_audio), sorted(keep_subs), output_file)
 
     if dry_run:
         console.print("[bold cyan]DRY RUN[/] — would execute:")

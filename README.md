@@ -19,12 +19,13 @@ kept as `stripaud.sh` for fallback.
 
 1. **Pick files** — gathers media files from the dir/glob args (directories are
    searched recursively), then an fzf-style fuzzy picker. TAB marks multiple
-   files, ENTER confirms. A live preview shows each file's audio tracks. A single
-   explicit file skips this step.
-2. **Pick tracks** — a checkbox menu per file (SPACE toggles, ENTER confirms);
-   all tracks start checked.
-3. **Strip** — removes unwanted audio with ffmpeg (stream copy, no re-encode) and
-   overwrites the original.
+   files, ENTER confirms. A single explicit file skips this step.
+2. **Pick audio tracks** — a checkbox menu per file (SPACE toggles, ENTER
+   confirms); all tracks start checked.
+3. **Pick subtitle tracks** — same checkbox menu for subtitles (skipped if the
+   file has none).
+4. **Strip** — removes the unselected audio/subtitle streams with ffmpeg (stream
+   copy, no re-encode) and overwrites the original.
 
 ## Flags
 
@@ -40,6 +41,6 @@ kept as `stripaud.sh` for fallback.
 ## Notes
 
 - Skips files where all tracks are kept (no-op) or none are selected
-- Preserves video, subtitles, attachments, and other streams
+- Preserves video, attachments, and other data streams
 - Uses stream copy (fast, no re-encoding)
 - Multi-select lets you batch several files in one run
