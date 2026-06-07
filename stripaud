@@ -83,37 +83,53 @@ def gather_candidates(paths):
     return sorted(files, key=lambda f: str(f))
 
 
+def fzf_pick(candidates):
+    """Run fzf to multi-select from candidates. Returns a list of Paths, or
+    None if fzf is unusable (not installed / failed to start its UI)."""
+    if not shutil.which("fzf"):
+        return None
+
+    proc = subprocess.run(
+        [
+            "fzf",
+            "--multi",
+            "--prompt", "Select media file(s) [TAB to mark]: ",
+            "--header", "TAB to mark multiple · ENTER to confirm · ESC to cancel",
+            "--height", "60%",
+            "--layout", "reverse",
+            "--border",
+        ],
+        input="\n".join(str(c) for c in candidates),
+        text=True,
+        # fzf draws its UI on /dev/tty (not stdout/stderr), so capturing both is
+        # safe and lets us report *why* fzf failed instead of silently bailing.
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode == 0:
+        return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
+    if proc.returncode in (1, 130):
+        # 1 = no match, 130 = user pressed ESC/Ctrl-C — a deliberate empty pick
+        return []
+    # Any other code means fzf couldn't run (e.g. no controlling terminal).
+    msg = proc.stderr.strip() or f"exit code {proc.returncode}"
+    err.print(f"[yellow]fzf could not start ({msg}). Falling back to a list picker.[/]")
+    return None
+
+
 def pick_files(candidates):
     """Step 0: choose which files to work on. Returns a list of Paths."""
     if len(candidates) == 1:
         return candidates
 
-    if shutil.which("fzf"):
-        proc = subprocess.run(
-            [
-                "fzf",
-                "--multi",
-                "--prompt", "Select media file(s) [TAB to mark]: ",
-                "--header", "TAB to mark multiple · ENTER to confirm · ESC to cancel",
-                "--height", "60%",
-                "--layout", "reverse",
-                "--border",
-            ],
-            input="\n".join(str(c) for c in candidates),
-            text=True,
-            # Capture only stdout (the selection). fzf draws its interactive UI
-            # to stderr, so it must stay attached to the terminal — capturing it
-            # leaves fzf with nowhere to render the filter box on some hosts.
-            stdout=subprocess.PIPE,
-        )
-        if proc.returncode not in (0,):  # 130 = cancelled, 1 = no match
-            return []
-        return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
+    picked = fzf_pick(candidates)
+    if picked is not None:
+        return picked
 
-    # Fallback: questionary checkbox picker (no fzf installed)
+    # Fallback: questionary checkbox picker (no fzf / fzf failed)
     choices = [Choice(title=str(c), value=c) for c in candidates]
     picked = questionary.checkbox(
-        "Select media file(s) to work on:", choices=choices
+        "Select media file(s) to work on:", choices=choices, style=TRACK_STYLE
     ).ask()
     return picked or []
 
