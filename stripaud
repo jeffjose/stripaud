@@ -21,10 +21,13 @@ Usage:
     stripaud /path/to/*prefix*         # glob (expanded by your shell)
     stripaud /path/to/videos -a        # batch everything, skip the picker
     stripaud /path/to/videos -p        # go straight to the picker
+    stripaud /path/to/videos -f hin    # only files with a 'hin' track
+    stripaud /path/to/videos --audio-only   # ignore subtitles entirely
     stripaud . --dry-run               # walk the flow, change nothing
 """
 
 import argparse
+import functools
 import json
 import os
 import shutil
@@ -212,6 +215,7 @@ def pick_files(candidates, mode):
     return picked or []
 
 
+@functools.lru_cache(maxsize=None)
 def get_tracks(path, select):
     """Return track dicts for the given stream type ('a' audio, 's' subtitle),
     in stream order. The 'index' field is 0-based within that type, suitable
@@ -246,19 +250,53 @@ def get_tracks(path, select):
     return tracks
 
 
+def track_matches(tracks, needle):
+    """True if any track's language or title contains needle (case-insensitive)."""
+    n = needle.lower()
+    return any(
+        n in (t["language"] or "").lower() or n in (t["title"] or "").lower()
+        for t in tracks
+    )
+
+
+def filter_candidates(candidates, needle, do_audio, do_subs):
+    """Drop files that have no track matching needle, so a `-f hin` run never
+    shows you the other 8 episodes. Scope follows --audio-only / --subs-only:
+    by default a hit in either audio or subtitles counts."""
+    kept = []
+    with console.status(f"Looking for tracks matching '{needle}'…"):
+        for c in candidates:
+            hit = (do_audio and track_matches(get_tracks(c, "a"), needle)) or (
+                do_subs and track_matches(get_tracks(c, "s"), needle)
+            )
+            if hit:
+                kept.append(c)
+
+    where = " or ".join(k for k, on in (("audio", do_audio), ("subtitle", do_subs)) if on)
+    console.print(
+        f"[dim]Filter '{needle}' ({where}): {len(kept)} of {len(candidates)} file(s) match.[/]"
+    )
+    return kept
+
+
 def track_label(n, t):
     title = t["title"] or "—"
     return f"Track {n}: {t['codec']}, lang={t['language']}, title={title}"
 
 
-def choose_tracks(tracks, kind):
-    """Checkbox UI. Returns list of indices to KEEP, or None if cancelled."""
+def choose_tracks(tracks, kind, header):
+    """Checkbox UI. Returns list of indices to KEEP, or None if cancelled.
+
+    header names the file being asked about — the rule printed above scrolls
+    out of view once you're a few files into a batch, but the prompt line
+    stays put while you're toggling.
+    """
     choices = [
         Choice(title=track_label(i + 1, t), value=t["index"], checked=True)
         for i, t in enumerate(tracks)
     ]
     return questionary.checkbox(
-        f"Select {kind} tracks to KEEP (SPACE toggles, ENTER confirms):",
+        f"{header} · {kind} tracks to KEEP (SPACE toggles, ENTER confirms):",
         choices=choices,
         style=TRACK_STYLE,
     ).ask()
@@ -289,18 +327,22 @@ def report_selection(label, tracks, keep):
         console.print(f"[red]Drop {label}:[/] {', '.join(track_label(t['index'] + 1, t) for t in dropped)}")
 
 
-def plan_file(input_file, idx, total):
+def plan_file(input_file, idx, total, do_audio=True, do_subs=True):
     """Ask all the questions for one file. Returns a plan dict:
 
         {"file", "audio", "subs", "keep_audio", "keep_subs", "status"}
 
     status is "pending" when there is real work to do, otherwise the terminal
     outcome ("skipped" / "noop") — no ffmpeg run will happen for those.
+
+    A stream type that's switched off isn't asked about and is kept in full.
     """
     if total > 1:
         console.rule(f"[bold]{idx}/{total}[/]  {input_file.name}")
+        header = f"[{idx}/{total}] {input_file.name}"
     else:
         console.print(f"\n[bold]{input_file.name}[/]")
+        header = input_file.name
 
     def plan(status, keep_audio=None, keep_subs=None, audio=(), subs=()):
         return {
@@ -315,26 +357,28 @@ def plan_file(input_file, idx, total):
     audio = get_tracks(input_file, "a")
     subs = get_tracks(input_file, "s")
 
-    if not audio and not subs:
-        console.print("[yellow]No audio or subtitle tracks found. Skipping.[/]")
-        return plan("skipped")
+    askable = (audio if do_audio else []) + (subs if do_subs else [])
+    if not askable:
+        kinds = " or ".join(k for k, on in (("audio", do_audio), ("subtitle", do_subs)) if on)
+        console.print(f"[yellow]No {kinds} tracks found. Skipping.[/]")
+        return plan("skipped", [t["index"] for t in audio], [t["index"] for t in subs], audio, subs)
 
-    # Step 2: audio tracks
+    # Step 2: audio tracks (kept wholesale when audio isn't in scope)
     keep_audio = [t["index"] for t in audio]
-    if audio:
-        keep_audio = choose_tracks(audio, "audio")
+    if audio and do_audio:
+        keep_audio = choose_tracks(audio, "audio", header)
         if keep_audio is None:
             console.print("[yellow]Cancelled. Skipping this file.[/]")
             return plan("skipped", audio=audio, subs=subs)
 
-    # Step 3: subtitle tracks
+    # Step 3: subtitle tracks (same)
     keep_subs = [t["index"] for t in subs]
-    if subs:
-        keep_subs = choose_tracks(subs, "subtitle")
+    if subs and do_subs:
+        keep_subs = choose_tracks(subs, "subtitle", header)
         if keep_subs is None:
             console.print("[yellow]Cancelled. Skipping this file.[/]")
             return plan("skipped", audio=audio, subs=subs)
-    else:
+    elif not subs and do_subs:
         console.print("[dim]No subtitle tracks.[/]")
 
     report_selection("audio", audio, keep_audio)
@@ -424,6 +468,24 @@ def main():
         action="store_true",
         help="don't ask for confirmation before processing the batch",
     )
+    parser.add_argument(
+        "-f", "--filter",
+        metavar="TEXT",
+        help="only work on files having a track whose language or title matches "
+             "TEXT (e.g. -f hin); searches audio and subtitles, or just the one "
+             "you scoped with --audio-only / --subs-only",
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--audio-only",
+        action="store_true",
+        help="only ask about audio tracks; keep every subtitle track",
+    )
+    scope.add_argument(
+        "--subs-only",
+        action="store_true",
+        help="only ask about subtitle tracks; keep every audio track",
+    )
     picking = parser.add_mutually_exclusive_group()
     picking.add_argument(
         "-a", "--all",
@@ -438,10 +500,21 @@ def main():
     )
     args = parser.parse_args()
 
+    do_audio = not args.subs_only
+    do_subs = not args.audio_only
+
     candidates, searched_dir = gather_candidates(args.paths)
     if not candidates:
         err.print("[red]No media files found.[/]")
         sys.exit(1)
+
+    # Filter before anything else: the non-matching files shouldn't show up in
+    # the picker, the questions, or the plan.
+    if args.filter:
+        candidates = filter_candidates(candidates, args.filter, do_audio, do_subs)
+        if not candidates:
+            err.print(f"[red]No files with a track matching '{args.filter}'.[/]")
+            sys.exit(1)
 
     if args.all_files:
         mode = "all"
@@ -466,7 +539,10 @@ def main():
         console.print("[bold cyan]-- dry run: no files will be modified --[/]")
 
     # Phase 1: ask everything up front, one file after another.
-    plans = [plan_file(f, i, len(selected)) for i, f in enumerate(selected, 1)]
+    plans = [
+        plan_file(f, i, len(selected), do_audio, do_subs)
+        for i, f in enumerate(selected, 1)
+    ]
 
     counts = {}
     for p in plans:

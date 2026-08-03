@@ -10,6 +10,8 @@ Interactive audio track manager for video files. Keep what you want, strip what 
 ./stripaud /path/to/*prefix*          # glob — batches every match, no picker
 ./stripaud /path/to/videos -a         # batch a whole directory, no picker
 ./stripaud /path/to/*.mkv -p          # force the picker on an explicit list
+./stripaud /path/to/videos -f hin     # only files that have a 'hin' track
+./stripaud /path/to/videos --audio-only   # ignore subtitles entirely
 ./stripaud . --dry-run                # walk the flow, change nothing
 ```
 
@@ -33,7 +35,8 @@ fork question altogether.
 
 `stripaud` is a self-contained Python script run via [uv](https://docs.astral.sh/uv/)
 inline dependencies — no manual `pip install` needed. The original Bash version is
-kept as `stripaud.sh` for fallback.
+kept as `stripaud.sh` for fallback; it asks for confirmation before running so you
+don't end up in it by accident (`STRIPAUD_LEGACY_OK=1` skips the prompt).
 
 ## How it works
 
@@ -44,8 +47,10 @@ every file. Answer, walk away, come back to a finished batch.
    searched recursively), then forks: take them all, or open an fzf-style fuzzy
    picker (TAB marks multiple files, ENTER confirms).
 2. **Pick tracks, per file** — a checkbox menu for audio and one for subtitles
-   (SPACE toggles, ENTER confirms); all tracks start checked. This repeats for
-   each file, back to back, with no processing in between.
+   (SPACE toggles, ENTER confirms); all tracks start checked. Each prompt is
+   labelled with the file it's asking about (`[3/24] S01E03.mkv · audio tracks
+   to KEEP`). This repeats for each file, back to back, with no processing in
+   between.
 3. **Confirm the plan** — a one-line-per-file recap of what will be kept and
    dropped, then a single yes/no for the whole batch.
 4. **Strip** — removes the unselected audio/subtitle streams with ffmpeg (stream
@@ -58,6 +63,13 @@ every file. Answer, walk away, come back to a finished batch.
 - `-a`, `--all` — work on every match, skipping the file picker.
 - `-p`, `--pick` — always show the file picker, even for explicitly named files.
 - `-y`, `--yes` — skip the batch confirmation prompt.
+- `-f`, `--filter TEXT` — only work on files that have a track whose language or
+  title contains TEXT (case-insensitive). `-f hin` on a 20-file season leaves you
+  with just the Hindi ones; the rest are never shown, asked about, or listed.
+  The search follows the scope flags below — plain `-f hin` looks at audio *and*
+  subtitles, `-f hin --audio-only` looks at audio only.
+- `--audio-only` — only ask about audio tracks; every subtitle track is kept.
+- `--subs-only` — only ask about subtitle tracks; every audio track is kept.
 
 ## Requirements
 

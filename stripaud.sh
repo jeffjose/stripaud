@@ -287,6 +287,42 @@ process_multiple_files() {
   echo "================================================"
 }
 
+# Speed hump: this is the superseded Bash version, kept only as a fallback.
+# `stripaud` (Python) asks everything up front and batches the work; this one
+# still interleaves questions with ffmpeg runs. Make sure you meant to be here.
+confirm_legacy() {
+  if [ -n "$STRIPAUD_LEGACY_OK" ]; then
+    return 0
+  fi
+
+  echo "-----------------------------------------------------------"
+  echo "  You are running stripaud.sh — the OLD Bash version."
+  echo ""
+  echo "  Use ./stripaud instead (Python). It asks all its questions"
+  echo "  up front, then processes the whole batch in one go, and"
+  echo "  supports --filter / --audio-only / --subs-only / --dry-run."
+  echo ""
+  echo "  This script is kept for backwards compatibility only."
+  echo "-----------------------------------------------------------"
+  echo ""
+
+  if [ ! -t 0 ]; then
+    echo "Refusing to run non-interactively. Set STRIPAUD_LEGACY_OK=1 if you"
+    echo "really want the legacy script."
+    exit 1
+  fi
+
+  printf "Continue with the legacy script anyway? [y/N] "
+  read -r reply
+  case "$reply" in
+    [yY] | [yY][eE][sS]) echo "" ;;
+    *)
+      echo "Aborted. Nothing was changed."
+      exit 0
+      ;;
+  esac
+}
+
 main() {
   if [ $# -eq 0 ]; then
     echo "Usage: $0 <media_file_or_directory_or_pattern>"
@@ -299,7 +335,9 @@ main() {
     echo "  $0 .                          # Search in current directory"
     exit 1
   fi
-  
+
+  confirm_legacy
+
   # Check if we're dealing with a glob pattern by checking if multiple files match
   matching_files=()
   for arg in "$@"; do
