@@ -63,11 +63,16 @@ every file. Answer, walk away, come back to a finished batch.
 - `-a`, `--all` — work on every match, skipping the file picker.
 - `-p`, `--pick` — always show the file picker, even for explicitly named files.
 - `-y`, `--yes` — skip the batch confirmation prompt.
-- `-f`, `--filter TEXT` — only work on files that have a track whose language or
-  title contains TEXT (case-insensitive). `-f hin` on a 20-file season leaves you
-  with just the Hindi ones; the rest are never shown, asked about, or listed.
-  The search follows the scope flags below — plain `-f hin` looks at audio *and*
-  subtitles, `-f hin --audio-only` looks at audio only.
+- `-f`, `--filter TEXT` — only work on files that have a track matching TEXT.
+  `-f hin` on a 20-file season leaves you with just the Hindi ones; the rest are
+  never shown, asked about, or listed. The search follows the scope flags below
+  — plain `-f hin` looks at audio *and* subtitles, `-f hin --audio-only` looks
+  at audio only.
+
+  Matching is case-insensitive on the track's language code and the start of
+  any word in its title, not a raw substring: `-f hin` finds `hin`, `hi`,
+  `Hindi` and `"Chinese (Hindi dub)"`, but *not* a Chinese track titled
+  `China`. Codes match from either end, so `-f hindi` still finds `lang=hin`.
 - `--audio-only` — only ask about audio tracks; every subtitle track is kept.
 - `--subs-only` — only ask about subtitle tracks; every audio track is kept.
 

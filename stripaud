@@ -30,6 +30,7 @@ import argparse
 import functools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -176,22 +177,30 @@ def fzf_pick(candidates):
     return None
 
 
-def choose_mode(candidates, prefer_all):
+def choose_mode(candidates, prefer_all, total=None, needle=None):
     """The fork: batch everything, or hunt for specific files?
 
     Marking 20 files one TAB at a time is worse than just saying "all of them",
     so ask which you want up front instead of always opening the picker.
     prefer_all decides which option starts highlighted. Returns "all", "pick",
     or None if cancelled.
+
+    When a --filter is on, total is the count before filtering: "all 10" on its
+    own reads as scary when you passed 40 paths, so say 10 of 40, matching what.
     """
     n = len(candidates)
-    all_choice = Choice(title=f"Process all {n} files — ask me about each one", value="all")
+    if needle:
+        question = f"Found {n} of {total} files with a track matching '{needle}'. What do you want to do?"
+        all_title = f"Process all {n} matching files — ask me about each one"
+    else:
+        question = f"Found {n} media files. What do you want to do?"
+        all_title = f"Process all {n} files — ask me about each one"
+
+    all_choice = Choice(title=all_title, value="all")
     pick_choice = Choice(title="Pick specific file(s) from a list", value="pick")
     choices = [all_choice, pick_choice] if prefer_all else [pick_choice, all_choice]
     return questionary.select(
-        f"Found {n} media files. What do you want to do?",
-        choices=choices,
-        style=TRACK_STYLE,
+        question, choices=choices, style=TRACK_STYLE
     ).ask()
 
 
@@ -250,13 +259,38 @@ def get_tracks(path, select):
     return tracks
 
 
-def track_matches(tracks, needle):
-    """True if any track's language or title contains needle (case-insensitive)."""
-    n = needle.lower()
+def lang_matches(lang, needle):
+    """Match language codes from either end, so hin/hi/hindi all find each other.
+
+    Prefixes only — a plain substring test would match 'hin' against 'chi'
+    the moment a title like "China" is in play.
+    """
+    l = (lang or "").lower().strip()
+    if not l:
+        return False
+    return l.startswith(needle) or (len(l) >= 2 and needle.startswith(l))
+
+
+def title_matches(title, needle):
+    """Match the start of any word in the title: 'hin' hits "Hindi 5.1" but not
+    "China", which is the bug that made -f hin match a Chinese-only release."""
     return any(
-        n in (t["language"] or "").lower() or n in (t["title"] or "").lower()
+        word.startswith(needle)
+        for word in re.findall(r"[a-z0-9]+", (title or "").lower())
+    )
+
+
+def track_matches(tracks, needle):
+    """True if any track's language or title matches needle (case-insensitive)."""
+    n = needle.lower().strip()
+    return any(
+        lang_matches(t["language"], n) or title_matches(t["title"], n)
         for t in tracks
     )
+
+
+def scope_label(do_audio, do_subs):
+    return " or ".join(k for k, on in (("audio", do_audio), ("subtitle", do_subs)) if on)
 
 
 def filter_candidates(candidates, needle, do_audio, do_subs):
@@ -264,18 +298,13 @@ def filter_candidates(candidates, needle, do_audio, do_subs):
     shows you the other 8 episodes. Scope follows --audio-only / --subs-only:
     by default a hit in either audio or subtitles counts."""
     kept = []
-    with console.status(f"Looking for tracks matching '{needle}'…"):
+    with console.status(f"Looking for {scope_label(do_audio, do_subs)} tracks matching '{needle}'…"):
         for c in candidates:
             hit = (do_audio and track_matches(get_tracks(c, "a"), needle)) or (
                 do_subs and track_matches(get_tracks(c, "s"), needle)
             )
             if hit:
                 kept.append(c)
-
-    where = " or ".join(k for k, on in (("audio", do_audio), ("subtitle", do_subs)) if on)
-    console.print(
-        f"[dim]Filter '{needle}' ({where}): {len(kept)} of {len(candidates)} file(s) match.[/]"
-    )
     return kept
 
 
@@ -471,9 +500,10 @@ def main():
     parser.add_argument(
         "-f", "--filter",
         metavar="TEXT",
-        help="only work on files having a track whose language or title matches "
-             "TEXT (e.g. -f hin); searches audio and subtitles, or just the one "
-             "you scoped with --audio-only / --subs-only",
+        help="only work on files having a track matching TEXT (e.g. -f hin) — "
+             "by language code, or by the start of a word in the track title; "
+             "searches audio and subtitles, or just the one you scoped with "
+             "--audio-only / --subs-only",
     )
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument(
@@ -510,11 +540,23 @@ def main():
 
     # Filter before anything else: the non-matching files shouldn't show up in
     # the picker, the questions, or the plan.
+    total_found = len(candidates)
     if args.filter:
         candidates = filter_candidates(candidates, args.filter, do_audio, do_subs)
         if not candidates:
-            err.print(f"[red]No files with a track matching '{args.filter}'.[/]")
+            err.print(
+                f"[red]No files with {scope_label(do_audio, do_subs)} tracks "
+                f"matching '{args.filter}'[/] (searched {total_found})."
+            )
             sys.exit(1)
+
+    asking = not args.all_files and not args.pick and len(candidates) > 1
+    if args.filter and not asking:
+        # When we're about to ask, the question itself states the counts.
+        console.print(
+            f"[dim]Filter '{args.filter}' ({scope_label(do_audio, do_subs)}): "
+            f"{len(candidates)} of {total_found} file(s) match.[/]"
+        )
 
     if args.all_files:
         mode = "all"
@@ -523,7 +565,12 @@ def main():
     elif len(candidates) > 1:
         # You already chose when you typed `stripaud *.mkv`; a directory arg is
         # a search. That only sets the default — you still get the final say.
-        mode = choose_mode(candidates, prefer_all=not searched_dir)
+        mode = choose_mode(
+            candidates,
+            prefer_all=not searched_dir,
+            total=total_found,
+            needle=args.filter,
+        )
         if mode is None:
             console.print("Cancelled.")
             sys.exit(0)
