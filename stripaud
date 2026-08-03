@@ -11,10 +11,16 @@
 Pick files (fzf-style fuzzy multi-select), choose which audio tracks to keep,
 and strip the rest with ffmpeg (stream copy, no re-encode).
 
+All the questions are asked first, for every file, and the whole batch is
+processed afterwards in one go — so you're never waiting on ffmpeg between
+prompts.
+
 Usage:
     stripaud video.mp4                 # single file
     stripaud /path/to/videos           # search a directory, then pick
     stripaud /path/to/*prefix*         # glob (expanded by your shell)
+    stripaud /path/to/videos -a        # batch everything, skip the picker
+    stripaud /path/to/videos -p        # go straight to the picker
     stripaud . --dry-run               # walk the flow, change nothing
 """
 
@@ -56,9 +62,13 @@ def gather_candidates(paths):
     Directories are searched recursively; individual files are taken as-is
     if they have a known media extension. Globs are already expanded by the
     shell before they reach us.
+
+    Returns (files, searched_a_dir). searched_a_dir tells the caller whether
+    any file came from walking a directory rather than being named outright.
     """
     files = []
     seen = set()
+    searched = False
 
     def add(p):
         rp = p.resolve()
@@ -69,6 +79,7 @@ def gather_candidates(paths):
     for raw in paths:
         p = Path(raw)
         if p.is_dir():
+            searched = True
             for f in sorted(p.rglob("*")):
                 if f.is_file() and f.suffix.lower() in MEDIA_EXTS:
                     add(f)
@@ -80,7 +91,7 @@ def gather_candidates(paths):
         else:
             err.print(f"[yellow]No such file or directory:[/] {p}")
 
-    return sorted(files, key=lambda f: str(f))
+    return sorted(files, key=lambda f: str(f)), searched
 
 
 def find_fzf():
@@ -162,9 +173,31 @@ def fzf_pick(candidates):
     return None
 
 
-def pick_files(candidates):
-    """Step 0: choose which files to work on. Returns a list of Paths."""
-    if len(candidates) == 1:
+def choose_mode(candidates, prefer_all):
+    """The fork: batch everything, or hunt for specific files?
+
+    Marking 20 files one TAB at a time is worse than just saying "all of them",
+    so ask which you want up front instead of always opening the picker.
+    prefer_all decides which option starts highlighted. Returns "all", "pick",
+    or None if cancelled.
+    """
+    n = len(candidates)
+    all_choice = Choice(title=f"Process all {n} files — ask me about each one", value="all")
+    pick_choice = Choice(title="Pick specific file(s) from a list", value="pick")
+    choices = [all_choice, pick_choice] if prefer_all else [pick_choice, all_choice]
+    return questionary.select(
+        f"Found {n} media files. What do you want to do?",
+        choices=choices,
+        style=TRACK_STYLE,
+    ).ask()
+
+
+def pick_files(candidates, mode):
+    """Step 0: choose which files to work on. Returns a list of Paths.
+
+    mode is "all" (take everything, no picker) or "pick" (show the picker).
+    """
+    if len(candidates) == 1 or mode == "all":
         return candidates
 
     picked = fzf_pick(candidates)
@@ -246,18 +279,45 @@ def quote_cmd(cmd):
     return " ".join(shlex.quote(c) for c in cmd)
 
 
-def process_file(input_file, idx, total, dry_run):
+def report_selection(label, tracks, keep):
+    keep_set = set(keep)
+    kept = [t for t in tracks if t["index"] in keep_set]
+    dropped = [t for t in tracks if t["index"] not in keep_set]
+    if kept:
+        console.print(f"[green]Keep {label}:[/] {', '.join(track_label(t['index'] + 1, t) for t in kept)}")
+    if dropped:
+        console.print(f"[red]Drop {label}:[/] {', '.join(track_label(t['index'] + 1, t) for t in dropped)}")
+
+
+def plan_file(input_file, idx, total):
+    """Ask all the questions for one file. Returns a plan dict:
+
+        {"file", "audio", "subs", "keep_audio", "keep_subs", "status"}
+
+    status is "pending" when there is real work to do, otherwise the terminal
+    outcome ("skipped" / "noop") — no ffmpeg run will happen for those.
+    """
     if total > 1:
         console.rule(f"[bold]{idx}/{total}[/]  {input_file.name}")
     else:
         console.print(f"\n[bold]{input_file.name}[/]")
+
+    def plan(status, keep_audio=None, keep_subs=None, audio=(), subs=()):
+        return {
+            "file": input_file,
+            "audio": list(audio),
+            "subs": list(subs),
+            "keep_audio": sorted(keep_audio or []),
+            "keep_subs": sorted(keep_subs or []),
+            "status": status,
+        }
 
     audio = get_tracks(input_file, "a")
     subs = get_tracks(input_file, "s")
 
     if not audio and not subs:
         console.print("[yellow]No audio or subtitle tracks found. Skipping.[/]")
-        return "skipped"
+        return plan("skipped")
 
     # Step 2: audio tracks
     keep_audio = [t["index"] for t in audio]
@@ -265,7 +325,7 @@ def process_file(input_file, idx, total, dry_run):
         keep_audio = choose_tracks(audio, "audio")
         if keep_audio is None:
             console.print("[yellow]Cancelled. Skipping this file.[/]")
-            return "skipped"
+            return plan("skipped", audio=audio, subs=subs)
 
     # Step 3: subtitle tracks
     keep_subs = [t["index"] for t in subs]
@@ -273,40 +333,65 @@ def process_file(input_file, idx, total, dry_run):
         keep_subs = choose_tracks(subs, "subtitle")
         if keep_subs is None:
             console.print("[yellow]Cancelled. Skipping this file.[/]")
-            return "skipped"
+            return plan("skipped", audio=audio, subs=subs)
     else:
         console.print("[dim]No subtitle tracks.[/]")
 
-    def report(label, tracks, keep):
-        keep_set = set(keep)
-        kept = [t for t in tracks if t["index"] in keep_set]
-        dropped = [t for t in tracks if t["index"] not in keep_set]
-        if kept:
-            console.print(f"[green]Keep {label}:[/] {', '.join(track_label(t['index'] + 1, t) for t in kept)}")
-        if dropped:
-            console.print(f"[red]Drop {label}:[/] {', '.join(track_label(t['index'] + 1, t) for t in dropped)}")
-
-    report("audio", audio, keep_audio)
-    report("subtitle", subs, keep_subs)
+    report_selection("audio", audio, keep_audio)
+    report_selection("subtitle", subs, keep_subs)
 
     if not keep_audio and not keep_subs:
         console.print("[yellow]Nothing selected. Skipping this file.[/]")
-        return "skipped"
+        return plan("skipped", audio=audio, subs=subs)
 
     if len(keep_audio) == len(audio) and len(keep_subs) == len(subs):
         console.print("[dim]All tracks kept — no changes needed.[/]")
-        return "noop"
+        return plan("noop", keep_audio, keep_subs, audio, subs)
+
+    return plan("pending", keep_audio, keep_subs, audio, subs)
+
+
+def show_plan_summary(plans):
+    """One compact line per file, so a 20-episode batch stays scannable."""
+    console.rule("[bold]Plan[/]")
+
+    def part(label, tracks, keep):
+        if not tracks:
+            return f"[dim]no {label}[/]"
+        langs = ", ".join(t["language"] for t in tracks if t["index"] in set(keep))
+        color = "green" if keep else "red"
+        return f"[{color}]{label} {len(keep)}/{len(tracks)}[/]" + (f" ({langs})" if langs else "")
+
+    for p in plans:
+        name = p["file"].name
+        if p["status"] == "pending":
+            bits = [part("audio", p["audio"], p["keep_audio"]),
+                    part("subs", p["subs"], p["keep_subs"])]
+            console.print(f"  {name}  " + "  ".join(bits))
+        else:
+            reason = "no changes needed" if p["status"] == "noop" else "skipped"
+            console.print(f"  [dim]{name}  — {reason}[/]")
+
+
+def run_plan(p, idx, total, dry_run):
+    """Execute one planned file. Returns the outcome string."""
+    input_file = p["file"]
+    if total > 1:
+        console.rule(f"[bold]{idx}/{total}[/]  {input_file.name}")
+    else:
+        console.print(f"\n[bold]{input_file.name}[/]")
 
     output_file = input_file.with_name(f"{input_file.stem}.temp{input_file.suffix}")
-    cmd = build_ffmpeg_cmd(input_file, sorted(keep_audio), sorted(keep_subs), output_file)
+    cmd = build_ffmpeg_cmd(input_file, p["keep_audio"], p["keep_subs"], output_file)
 
     if dry_run:
         console.print("[bold cyan]DRY RUN[/] — would execute:")
-        console.print(f"  [dim]{quote_cmd(cmd)}[/]")
+        # emoji=False: rich would otherwise render ffmpeg's "0:a:0" as "0🅰0".
+        console.print(f"  [dim]{quote_cmd(cmd)}[/]", emoji=False)
         console.print(f"  [dim]then replace[/] {input_file}")
         return "dry-run"
 
-    console.print(f"[dim]{quote_cmd(cmd)}[/]")
+    console.print(f"[dim]{quote_cmd(cmd)}[/]", emoji=False)
     result = subprocess.run(cmd)
     if result.returncode == 0:
         os.replace(output_file, input_file)
@@ -334,14 +419,45 @@ def main():
         action="store_true",
         help="walk the full flow but take no action (no ffmpeg, no file changes)",
     )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="don't ask for confirmation before processing the batch",
+    )
+    picking = parser.add_mutually_exclusive_group()
+    picking.add_argument(
+        "-a", "--all",
+        dest="all_files",
+        action="store_true",
+        help="work on every match — skip the file picker",
+    )
+    picking.add_argument(
+        "-p", "--pick",
+        action="store_true",
+        help="always show the file picker, even for explicitly named files",
+    )
     args = parser.parse_args()
 
-    candidates = gather_candidates(args.paths)
+    candidates, searched_dir = gather_candidates(args.paths)
     if not candidates:
         err.print("[red]No media files found.[/]")
         sys.exit(1)
 
-    selected = pick_files(candidates)
+    if args.all_files:
+        mode = "all"
+    elif args.pick:
+        mode = "pick"
+    elif len(candidates) > 1:
+        # You already chose when you typed `stripaud *.mkv`; a directory arg is
+        # a search. That only sets the default — you still get the final say.
+        mode = choose_mode(candidates, prefer_all=not searched_dir)
+        if mode is None:
+            console.print("Cancelled.")
+            sys.exit(0)
+    else:
+        mode = "all"
+
+    selected = pick_files(candidates, mode)
     if not selected:
         console.print("No file selected.")
         sys.exit(0)
@@ -349,9 +465,34 @@ def main():
     if args.dry_run:
         console.print("[bold cyan]-- dry run: no files will be modified --[/]")
 
+    # Phase 1: ask everything up front, one file after another.
+    plans = [plan_file(f, i, len(selected)) for i, f in enumerate(selected, 1)]
+
     counts = {}
-    for i, f in enumerate(selected, 1):
-        outcome = process_file(f, i, len(selected), args.dry_run)
+    for p in plans:
+        if p["status"] != "pending":
+            counts[p["status"]] = counts.get(p["status"], 0) + 1
+
+    todo = [p for p in plans if p["status"] == "pending"]
+    if not todo:
+        console.print("\n[yellow]Nothing to do.[/]")
+        sys.exit(0)
+
+    # Phase 2: confirm the whole batch, then run it unattended.
+    if len(selected) > 1:
+        show_plan_summary(plans)
+        if not args.yes:
+            verb = "Simulate" if args.dry_run else "Process"
+            go = questionary.confirm(
+                f"{verb} {len(todo)} file(s) now?", default=True, style=TRACK_STYLE
+            ).ask()
+            if not go:
+                console.print("Aborted. Nothing was changed.")
+                sys.exit(0)
+
+    console.rule("[bold]Processing[/]")
+    for i, p in enumerate(todo, 1):
+        outcome = run_plan(p, i, len(todo), args.dry_run)
         counts[outcome] = counts.get(outcome, 0) + 1
 
     if len(selected) > 1:
